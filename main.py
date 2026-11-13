@@ -92,14 +92,26 @@ if run_updater():
     sys.exit(0)
 
 
-def validate_release(data):
-    """Return a safe Windows release manifest, or None when it is invalid."""
+def update_platform():
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return None
+
+
+def validate_release(data, platform_name=None):
+    """Return a safe release manifest for the current operating system."""
     if not isinstance(data, dict):
         return None
 
+    platform_name = platform_name or update_platform()
+    if not platform_name:
+        return None
+
     version = data.get("version")
-    download_url = data.get("windows_download_url")
-    checksum = data.get("windows_sha256")
+    download_url = data.get(f"{platform_name}_download_url")
+    checksum = data.get(f"{platform_name}_sha256")
 
     if not all(isinstance(value, str) and value for value in (version, download_url, checksum)):
         return None
@@ -111,6 +123,9 @@ def validate_release(data):
 
     parsed_url = urlparse(download_url)
     if parsed_url.scheme != "https" or not parsed_url.netloc:
+        return None
+
+    if platform_name == "macos" and not parsed_url.path.lower().endswith(".dmg"):
         return None
 
     if len(checksum) != 64 or any(char not in "0123456789abcdefABCDEF" for char in checksum):
@@ -151,10 +166,11 @@ class UpdateDownloadWorker(QThread):
     finished_successfully = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, download_url, expected_hash, parent=None):
+    def __init__(self, download_url, expected_hash, file_extension, parent=None):
         super().__init__(parent)
         self.download_url = download_url
         self.expected_hash = expected_hash.lower()
+        self.file_extension = file_extension
 
     def run(self):
         partial_path = None
@@ -170,7 +186,7 @@ class UpdateDownloadWorker(QThread):
             hasher = hashlib.sha256()
             partial_path = os.path.join(
                 tempfile.gettempdir(),
-                f"file-formatter-update-{uuid.uuid4().hex}.exe.part",
+                f"file-formatter-update-{uuid.uuid4().hex}{self.file_extension}.part",
             )
 
             with open(partial_path, "wb") as update_file:
@@ -206,8 +222,8 @@ class UpdateDownloadWorker(QThread):
 
 
 
-def start_updater(update_file):
-    if not getattr(sys, "frozen", False):
+def start_windows_updater(update_file):
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
         return False
 
     current_exe = os.path.abspath(sys.executable)
@@ -238,6 +254,18 @@ def start_updater(update_file):
 
         return True
 
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def open_macos_installer(update_file):
+    """Open a verified DMG in Finder for the user to install the new app."""
+    if sys.platform != "darwin":
+        return False
+
+    try:
+        subprocess.Popen(["open", update_file])
+        return True
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -858,6 +886,18 @@ def main():
 
     def begin_update_download(release):
         nonlocal update_worker
+        platform_name = update_platform()
+        if not platform_name:
+            return
+
+        if platform_name == "windows":
+            download_url = release["windows_download_url"]
+            expected_hash = release["windows_sha256"]
+            file_extension = ".exe"
+        else:
+            download_url = release["macos_download_url"]
+            expected_hash = release["macos_sha256"]
+            file_extension = ".dmg"
 
         progress_dialog = QProgressDialog(
             "Preparing update download…", None, 0, 0, window
@@ -870,8 +910,9 @@ def main():
         progress_dialog.show()
 
         update_worker = UpdateDownloadWorker(
-            release["windows_download_url"],
-            release["windows_sha256"],
+            download_url,
+            expected_hash,
+            file_extension,
             app,
         )
 
@@ -883,10 +924,30 @@ def main():
 
         def update_downloaded(update_file):
             nonlocal update_worker
+
+            if platform_name == "macos":
+                progress_dialog.close()
+                if open_macos_installer(update_file):
+                    QMessageBox.information(
+                        window,
+                        "Update Ready",
+                        "The verified update disk image has opened in Finder.\n\n"
+                        "Quit File Formatter, then drag the new File Formatter app "
+                        "into the Applications folder. Open it again when copying finishes.",
+                    )
+                else:
+                    QMessageBox.critical(
+                        window,
+                        "Update Failed",
+                        "The update was downloaded, but macOS could not open the disk image.",
+                    )
+                update_worker = None
+                return
+
             progress_dialog.setLabelText("Installing update and restarting…")
             progress_dialog.setRange(0, 0)
 
-            if not start_updater(update_file):
+            if not start_windows_updater(update_file):
                 progress_dialog.close()
                 try:
                     os.remove(update_file)
